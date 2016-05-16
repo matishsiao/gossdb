@@ -5,7 +5,7 @@ import (
 	"compress/gzip"
 	"encoding/base64"
 	"fmt"
-	"io"
+	_ "io"
 	"io/ioutil"
 	"log"
 	"math"
@@ -14,11 +14,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	_ "syscall"
 	"time"
 )
 
 type Client struct {
-	sock      *net.TCPConn
+	sock      net.Conn
 	recv_buf  bytes.Buffer
 	process   chan []interface{}
 	result    chan ClientResult
@@ -30,6 +31,7 @@ type Client struct {
 	Retry     bool
 	mu        *sync.Mutex
 	Closed    bool
+	init      bool
 }
 
 type ClientResult struct {
@@ -44,8 +46,8 @@ type HashData struct {
 	Value    string
 }
 
-var debug bool = true
-var version string = "0.1.5"
+var debug bool = false
+var version string = "0.1.6"
 
 const layout = "2006-01-06 15:04:05"
 
@@ -65,6 +67,7 @@ func Connect(ip string, port int, auth string) (*Client, error) {
 }
 
 func connect(ip string, port int, auth string) (*Client, error) {
+	log.Printf("SSDB Client Version:%s\n", version)
 	var c Client
 	c.Ip = ip
 	c.Port = port
@@ -82,27 +85,39 @@ func (c *Client) Debug(flag bool) bool {
 }
 
 func (c *Client) Connect() error {
-	addr, err := net.ResolveTCPAddr("tcp", fmt.Sprintf("%s:%d", c.Ip, c.Port))
+	log.Printf("Client[%s] connect to %s:%d\n", c.Id, c.Ip, c.Port)
+	/*addr, err := net.ResolveTCPAddr("tcp", fmt.Sprintf("%s:%d", c.Ip, c.Port))
 	if err != nil {
 		log.Println("Client ResolveTCPAddr failed:", err)
 		return err
-	}
-	sock, err := net.DialTCP("tcp", nil, addr)
+	}*/
+	seconds := 60
+	timeOut := time.Duration(seconds) * time.Second
+	sock, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", c.Ip, c.Port), timeOut)
 	if err != nil {
 		log.Println("SSDB Client dial failed:", err, c.Id)
 		return err
 	}
+	/*sock, err := net.DialTCP("tcp", nil, addr)
+	if err != nil {
+		log.Println("SSDB Client dial failed:", err, c.Id)
+		return err
+	}*/
 	c.sock = sock
 	c.Connected = true
 	if c.Retry {
-		if debug {
-			log.Printf("Client[%s] Retry connect to %s:%d success.", c.Id, c.Ip, c.Port)
-		}
+		log.Printf("Client[%s] retry connect to %s:%d success.", c.Id, c.Ip, c.Port)
+	} else {
+		log.Printf("Client[%s] connect to %s:%d success\n", c.Id, c.Ip, c.Port)
 	}
 	c.Retry = false
-	c.process = make(chan []interface{})
-	c.result = make(chan ClientResult)
-	go c.processDo()
+	if !c.init {
+		c.process = make(chan []interface{})
+		c.result = make(chan ClientResult)
+		go c.processDo()
+		c.init = true
+	}
+
 	if c.Password != "" {
 		c.Auth(c.Password)
 	}
@@ -134,25 +149,19 @@ func (c *Client) HealthCheck() {
 }
 
 func (c *Client) RetryConnect() {
-	c.mu.Lock()
-	Retry := false
 	if !c.Retry {
+		c.mu.Lock()
 		c.Retry = true
-		Retry = true
 		c.Connected = false
-	}
-	c.mu.Unlock()
-	if Retry {
-		log.Printf("Client[%s] Retry connect to %s:%d\n", c.Id, c.Ip, c.Port)
-
-		time.Sleep(2 * time.Second)
+		c.mu.Unlock()
+		log.Printf("Client[%s] retry connect to %s:%d Connected:%v Closed:%v\n", c.Id, c.Ip, c.Port, c.Connected, c.Closed)
 		for {
 			if !c.Connected && !c.Closed {
+				log.Printf("Client[%s] retry connect to %s:%d\n", c.Id, c.Ip, c.Port)
 				err := c.Connect()
 				if err != nil {
-					time.Sleep(10 * time.Second)
-				} else {
-					break
+					log.Printf("Client[%s] Retry connect to %s:%d Failed. Error:%v\n", c.Id, c.Ip, c.Port, err)
+					time.Sleep(5 * time.Second)
 				}
 			} else {
 				log.Printf("Client[%s] Retry connect to %s:%d stop by conn:%v closed:%v\n.", c.Id, c.Ip, c.Port, c.Connected, c.Closed)
@@ -163,8 +172,8 @@ func (c *Client) RetryConnect() {
 }
 
 func (c *Client) CheckError(err error) {
-	if err == io.EOF || strings.Contains(err.Error(), "connection") || strings.Contains(err.Error(), "timed out") || strings.Contains(err.Error(), "route") {
-
+	//if err == io.EOF || strings.Contains(err.Error(), "connection") || strings.Contains(err.Error(), "timed out") || strings.Contains(err.Error(), "route") {
+	if err != nil {
 		if !c.Closed {
 			log.Printf("Check Error:%v Retry connect.\n", err)
 			c.sock.Close()
@@ -179,11 +188,12 @@ func (c *Client) processDo() {
 		runId := args[0].(string)
 		runArgs := args[1:]
 		result, err := c.do(runArgs)
-		if c.Connected && !c.Retry && !c.Closed {
+		c.result <- ClientResult{Id: runId, Data: result, Error: err}
+		/*if c.Connected && !c.Retry && !c.Closed {
 			c.result <- ClientResult{Id: runId, Data: result, Error: err}
 		} else {
-			break
-		}
+			time.Sleep(1 * time.Second)
+		}*/
 	}
 	//close(c.result)
 	//log.Println("processDo process channel has closed")
@@ -209,31 +219,6 @@ func (c *Client) Do(args ...interface{}) ([]string, error) {
 		}
 	}
 	return nil, fmt.Errorf("Connection has closed.")
-}
-
-func (c *Client) MultiMode(args [][]interface{}) ([]string, error) {
-	if c.Connected {
-		for _, v := range args {
-			err := c.send(v)
-			if err != nil {
-				log.Printf("SSDB Client[%s] Do Send Error:%v Data:%v\n", c.Id, err, args)
-				c.CheckError(err)
-				return nil, err
-			}
-		}
-		var resps []string
-		for i := 0; i < len(args); i++ {
-			resp, err := c.recv()
-			if err != nil {
-				log.Printf("SSDB Client[%s] Do Receive Error:%v Data:%v\n", c.Id, err, args)
-				c.CheckError(err)
-				return nil, err
-			}
-			resps = append(resps, strings.Join(resp, ","))
-		}
-		return resps, nil
-	}
-	return nil, fmt.Errorf("lost connection")
 }
 
 func (c *Client) do(args []interface{}) ([]string, error) {
@@ -278,6 +263,7 @@ func (c *Client) ProcessCmd(cmd string, args []interface{}) (interface{}, error)
 		if resResult.Error != nil {
 			return nil, resResult.Error
 		}
+
 		resp := resResult.Data
 		if len(resp) == 2 && resp[0] == "ok" {
 			switch cmd {
@@ -320,12 +306,14 @@ func (c *Client) ProcessCmd(cmd string, args []interface{}) (interface{}, error)
 		}
 		log.Printf("SSDB Client Error Response:%v args:%v Error:%v", resp, args, err)
 		return nil, fmt.Errorf("bad response:%v args:%v", resp, args)
+	} else {
+		return nil, fmt.Errorf("lost connection")
 	}
-	return nil, fmt.Errorf("lost connection")
 }
 
 func (c *Client) Auth(pwd string) (interface{}, error) {
 	return c.Do("auth", pwd)
+	//return c.ProcessCmd("auth",params)
 }
 
 func (c *Client) Set(key string, val string) (interface{}, error) {
@@ -438,6 +426,31 @@ func (c *Client) MultiHashSet(parts []HashData, connNum int) (interface{}, error
 		return nil, errs[0]
 	}
 	return results, nil
+}
+
+func (c *Client) MultiMode(args [][]interface{}) ([]string, error) {
+	if c.Connected {
+		for _, v := range args {
+			err := c.send(v)
+			if err != nil {
+				log.Printf("SSDB Client[%s] Do Send Error:%v Data:%v\n", c.Id, err, args)
+				c.CheckError(err)
+				return nil, err
+			}
+		}
+		var resps []string
+		for i := 0; i < len(args); i++ {
+			resp, err := c.recv()
+			if err != nil {
+				log.Printf("SSDB Client[%s] Do Receive Error:%v Data:%v\n", c.Id, err, args)
+				c.CheckError(err)
+				return nil, err
+			}
+			resps = append(resps, strings.Join(resp, ","))
+		}
+		return resps, nil
+	}
+	return nil, fmt.Errorf("lost connection")
 }
 
 func (c *Client) HashGet(hash string, key string) (interface{}, error) {

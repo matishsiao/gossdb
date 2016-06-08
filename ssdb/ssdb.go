@@ -19,19 +19,20 @@ import (
 )
 
 type Client struct {
-	sock      net.Conn
-	recv_buf  bytes.Buffer
-	process   chan []interface{}
-	result    chan ClientResult
-	Id        string
-	Ip        string
-	Port      int
-	Password  string
-	Connected bool
-	Retry     bool
-	mu        *sync.Mutex
-	Closed    bool
-	init      bool
+	sock        net.Conn
+	recv_buf    bytes.Buffer
+	process     chan []interface{}
+	result      chan ClientResult
+	Id          string
+	Ip          string
+	Port        int
+	Password    string
+	Connected   bool
+	Retry       bool
+	mu          *sync.Mutex
+	Closed      bool
+	init        bool
+	skipReceive bool
 }
 
 type ClientResult struct {
@@ -74,6 +75,7 @@ func connect(ip string, port int, auth string) (*Client, error) {
 	c.Password = auth
 	c.Id = fmt.Sprintf("Cl-%d", time.Now().UnixNano())
 	c.mu = &sync.Mutex{}
+	c.skipReceive = false
 	err := c.Connect()
 	return &c, err
 }
@@ -117,7 +119,6 @@ func (c *Client) Connect() error {
 		go c.processDo()
 		c.init = true
 	}
-
 	if c.Password != "" {
 		c.Auth(c.Password)
 	}
@@ -127,6 +128,10 @@ func (c *Client) Connect() error {
 
 func (c *Client) KeepAlive() {
 	go c.HealthCheck()
+}
+
+func (c *Client) SkipRecev(flag bool) {
+	c.skipReceive = flag
 }
 
 func (c *Client) HealthCheck() {
@@ -230,6 +235,9 @@ func (c *Client) do(args []interface{}) ([]string, error) {
 			}
 			c.CheckError(err)
 			return nil, err
+		}
+		if c.skipReceive {
+			return []string{""}, nil
 		}
 		resp, err := c.recv()
 		if err != nil {

@@ -4,6 +4,19 @@ SSDB Go API Documentation
 @author: [ideawu](http://www.ideawu.com/)
 
 ## Add Feature
+
+* MultiMode
+
+Example
+
+    var args [][]interface{}
+    for i := 0; i < 10000; i++ {
+            args = append(args, []interface{}{"hset", "AAA" + strconv.Itoa(i), "BBB", "CCC"})
+    }
+    res, _ := DBClient.MultiMode(args)
+    log.Printf("%v", res)
+
+
 * For hash type k/v storage, create new functions for shorter API call from ```ssdb.Client.Do("hset",...,...)``` to ```ssdb.Client.HashSet()```
 * Add batch HashSet function ```Client.MultiHashSet()```
 
